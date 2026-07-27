@@ -162,6 +162,27 @@
     }
   }
 
+  function togglePlayback(player) {
+    const video = getPlayerVideo(player);
+    if (!video || isAdvertisementPlaying(player)) {
+      return false;
+    }
+
+    try {
+      if (video.paused || video.ended) {
+        const playResult = video.play();
+        if (playResult && typeof playResult.catch === "function") {
+          playResult.catch(() => {});
+        }
+      } else {
+        video.pause();
+      }
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
   function createSkipButton(player, direction) {
     const button = document.createElement("button");
     button.type = "button";
@@ -260,6 +281,9 @@
   }
 
   function handleKeydown(event) {
+    const isArrowKey = event.key === "ArrowLeft" || event.key === "ArrowRight";
+    const isSpaceKey =
+      event.code === "Space" || event.key === " " || event.key === "Spacebar";
     if (
       !settings.keyboardEnabled ||
       event.defaultPrevented ||
@@ -267,7 +291,8 @@
       event.ctrlKey ||
       event.metaKey ||
       event.shiftKey ||
-      (event.key !== "ArrowLeft" && event.key !== "ArrowRight") ||
+      (!isArrowKey && !isSpaceKey) ||
+      (isSpaceKey && event.repeat) ||
       isTypingOrNavigatingControls(event.target)
     ) {
       return;
@@ -278,8 +303,10 @@
       return;
     }
 
-    const direction = event.key === "ArrowLeft" ? -1 : 1;
-    if (seekPlayer(player, direction)) {
+    const handled = isSpaceKey
+      ? togglePlayback(player)
+      : seekPlayer(player, event.key === "ArrowLeft" ? -1 : 1);
+    if (handled) {
       event.preventDefault();
       event.stopImmediatePropagation();
     }
