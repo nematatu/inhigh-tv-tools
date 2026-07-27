@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "インハイTV スキップ操作",
+  "version": "1.0.0",
+  "description": "インハイTVの動画に秒数指定可能な戻る・進むボタンと左右矢印キー操作を追加します。",
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": ["https://inhightv.sportsbull.jp/*"],
+      "css": ["content.css"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "インハイTV スキップ設定",
+    "default_popup": "options.html"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  }
+}

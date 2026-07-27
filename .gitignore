@@ -1,0 +1,20 @@
+.DS_Store
+._*
+
+# 動画・ダウンロード途中ファイル
+*.mp4
+*.m4v
+*.mov
+*.ts
+*.part
+*.part.*
+test-downloads/
+.inhigh-download/
+
+# ローカル環境
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+node_modules/
