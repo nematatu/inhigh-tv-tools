@@ -28,6 +28,7 @@ import json
 import os
 import plistlib
 import re
+import selectors
 import shutil
 import signal
 import subprocess
@@ -71,6 +72,13 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 Chrome/
 VOLUMES_ROOT = Path("/Volumes")
 MINIMUM_EXTRA_BYTES = 10 * 1024**3
 ESTIMATE_MARGIN = 1.08
+FFMPEG_IO_TIMEOUT_MICROSECONDS = 30_000_000
+FFMPEG_STALL_TIMEOUT_SECONDS = 180.0
+FFMPEG_INTERRUPT_GRACE_SECONDS = 30.0
+FFMPEG_TERMINATE_GRACE_SECONDS = 5.0
+FFMPEG_MAX_ATTEMPTS = 2
+FFMPEG_RETRY_DELAY_SECONDS = 5.0
+MP4_DURATION_TOLERANCE_SECONDS = 2.0
 
 
 class DownloadError(RuntimeError):
@@ -129,6 +137,14 @@ class StreamInfo:
 
 
 @dataclasses.dataclass(frozen=True)
+class FfmpegOutcome:
+    return_code: int
+    processed_seconds: float
+    speed: str
+    stalled: bool
+
+
+@dataclasses.dataclass(frozen=True)
 class Volume:
     mount_point: Path
     device_identifier: str
@@ -144,6 +160,7 @@ class MenuOption:
 
 
 ACTIVE_PROCESSES: set[subprocess.Popen[Any]] = set()
+SIGINT_SENT_PROCESSES: set[subprocess.Popen[Any]] = set()
 ACTIVE_PROCESSES_LOCK = threading.Lock()
 STOP_EVENT = threading.Event()
 LOG_LOCK = threading.Lock()
@@ -575,6 +592,25 @@ class ProgressReporter:
                     bucket=bucket,
                 )
 
+    def reset(self, stream: StreamInfo, phase: str) -> None:
+        """同じ動画を再試行するとき、進捗と速度を0へ戻す。"""
+        filename = stream.item.filename
+        with OUTPUT_LOCK:
+            if self._closed:
+                return
+            self._processed[filename] = 0.0
+            self._speed_factors.pop(filename, None)
+            self._speed_labels.pop(filename, None)
+            self._terminal.discard(filename)
+            self._active.add(filename)
+            self._phases[filename] = phase
+            self._last_phase[filename] = phase
+            self._last_bucket.pop(filename, None)
+            if self._live:
+                self._render_live_locked(force=True)
+            else:
+                print(self._stream_status(filename), file=self._output, flush=True)
+
     def event(self, message: str) -> None:
         """固定表示を一時消去し、完了・失敗などの確定イベントを1行残す。"""
         with OUTPUT_LOCK:
@@ -752,6 +788,25 @@ def parse_manifest_variants(manifest: str) -> list[dict[str, Any]]:
     return variants
 
 
+def media_playlist_duration(manifest: str) -> float | None:
+    """終端が明示されたVODプレイリストから全セグメント時間を合計する。"""
+    if "#EXT-X-ENDLIST" not in manifest:
+        return None
+    durations: list[float] = []
+    for line in manifest.splitlines():
+        if not line.startswith("#EXTINF:"):
+            continue
+        value = line.split(":", 1)[1].split(",", 1)[0]
+        try:
+            duration = float(value)
+        except ValueError:
+            continue
+        if duration > 0:
+            durations.append(duration)
+    total = sum(durations)
+    return total if total > 0 else None
+
+
 def choose_variant(variants: list[dict[str, Any]], max_height: int) -> dict[str, Any]:
     video_variants = [variant for variant in variants if int(variant["height"]) > 0]
     if not video_variants:
@@ -811,6 +866,10 @@ def resolve_stream(item: ArchiveItem, project: str, api_key: str, max_height: in
         average_bitrate = int(source.get("average_bitrate") or source.get("bandwidth") or 0)
 
     duration = float(playback.get("duration") or 0)
+    media_manifest = fetch_bytes(variant_url).decode("utf-8", errors="replace")
+    playlist_duration = media_playlist_duration(media_manifest)
+    if playlist_duration is not None:
+        duration = playlist_duration
     if duration <= 0 or average_bitrate <= 0:
         raise DownloadError(f"動画の長さ・ビットレートを取得できません: {item.filename}")
     return StreamInfo(
@@ -1021,7 +1080,11 @@ def verify_mp4(path: Path, expected_duration: float | None = None) -> tuple[bool
         return False, f"ffprobe結果の解析エラー: {error}"
     if not any(stream.get("codec_type") == "video" for stream in streams):
         return False, "映像ストリームがありません"
-    minimum = 60.0 if not expected_duration else max(60.0, expected_duration * 0.90)
+    minimum = (
+        60.0
+        if not expected_duration
+        else max(60.0, expected_duration - MP4_DURATION_TOLERANCE_SECONDS)
+    )
     if duration < minimum:
         if expected_duration:
             return False, f"動画が短すぎます: {duration:.1f}秒（期待値 {expected_duration:.1f}秒）"
@@ -1075,16 +1138,168 @@ def append_log(log_path: Path, message: str) -> None:
             handle.flush()
 
 
+def send_sigint_once(process: subprocess.Popen[Any]) -> None:
+    """同じffmpegへSIGINTを重ねてMP4確定処理を壊さないよう、1回だけ送る。"""
+    with ACTIVE_PROCESSES_LOCK:
+        if process in SIGINT_SENT_PROCESSES or process.poll() is not None:
+            return
+        SIGINT_SENT_PROCESSES.add(process)
+    try:
+        process.send_signal(signal.SIGINT)
+    except OSError:
+        pass
+
+
+def wait_for_processes(processes: list[subprocess.Popen[Any]], timeout: float) -> list[subprocess.Popen[Any]]:
+    deadline = time.monotonic() + timeout
+    remaining = [process for process in processes if process.poll() is None]
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.1)
+        remaining = [process for process in remaining if process.poll() is None]
+    return remaining
+
+
+def stop_process_gracefully(process: subprocess.Popen[Any]) -> None:
+    """SIGINTでMP4確定を待ち、終了しなければ段階的に停止する。"""
+    send_sigint_once(process)
+    remaining = wait_for_processes([process], FFMPEG_INTERRUPT_GRACE_SECONDS)
+    if remaining:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        remaining = wait_for_processes([process], FFMPEG_TERMINATE_GRACE_SECONDS)
+    if remaining:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        wait_for_processes([process], FFMPEG_TERMINATE_GRACE_SECONDS)
+
+
 def terminate_active_processes() -> None:
+    """全ffmpegへ1回だけSIGINTを送り、待機上限後に段階的に停止する。"""
     STOP_EVENT.set()
     with ACTIVE_PROCESSES_LOCK:
         processes = list(ACTIVE_PROCESSES)
     for process in processes:
-        if process.poll() is None:
-            try:
-                process.send_signal(signal.SIGINT)
-            except OSError:
-                pass
+        send_sigint_once(process)
+    remaining = wait_for_processes(processes, FFMPEG_INTERRUPT_GRACE_SECONDS)
+    for process in remaining:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    remaining = wait_for_processes(remaining, FFMPEG_TERMINATE_GRACE_SECONDS)
+    for process in remaining:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    wait_for_processes(remaining, FFMPEG_TERMINATE_GRACE_SECONDS)
+
+
+def monitor_ffmpeg(
+    process: subprocess.Popen[Any],
+    stream: StreamInfo,
+    progress: ProgressReporter,
+    *,
+    stall_timeout: float = FFMPEG_STALL_TIMEOUT_SECONDS,
+) -> FfmpegOutcome:
+    """ffmpeg進捗を読み、処理時間が進まない状態を検出して安全に停止する。"""
+    if process.stdout is None:
+        raise DownloadError("ffmpegの進捗出力を取得できませんでした。")
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    buffer = b""
+    processed_seconds = 0.0
+    speed = ""
+    last_advanced_at = time.monotonic()
+    stalled = False
+    eof = False
+
+    def consume(raw_line: bytes) -> None:
+        nonlocal processed_seconds, speed, last_advanced_at
+        key, separator, value = raw_line.decode("utf-8", errors="replace").strip().partition("=")
+        if not separator:
+            return
+        if key == "out_time":
+            candidate = parse_ffmpeg_time(value)
+            if candidate > processed_seconds + 0.01:
+                processed_seconds = candidate
+                last_advanced_at = time.monotonic()
+        elif key == "speed":
+            speed = value
+        elif key == "progress":
+            if value == "end":
+                last_advanced_at = time.monotonic()
+                progress.update(
+                    stream,
+                    "データ取得完了・ffmpeg終了確認中",
+                    processed_seconds=stream.duration_seconds,
+                    speed=speed,
+                    force=True,
+                )
+            else:
+                progress.update(
+                    stream,
+                    "ダウンロード＋MP4作成中（ffmpeg）",
+                    processed_seconds=min(processed_seconds, stream.duration_seconds * 0.999),
+                    speed=speed,
+                )
+
+    try:
+        while not eof:
+            events = selector.select(timeout=1.0)
+            if events:
+                try:
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    eof = True
+                else:
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        raw_line, buffer = buffer.split(b"\n", 1)
+                        consume(raw_line)
+            if process.poll() is not None and not events:
+                try:
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    buffer += chunk
+                else:
+                    eof = True
+            if (
+                not STOP_EVENT.is_set()
+                and process.poll() is None
+                and time.monotonic() - last_advanced_at >= stall_timeout
+            ):
+                stalled = True
+                progress.update(
+                    stream,
+                    "通信停滞を検出・ffmpegを安全に終了中",
+                    processed_seconds=min(processed_seconds, stream.duration_seconds * 0.999),
+                    speed=speed,
+                    force=True,
+                )
+                stop_process_gracefully(process)
+                break
+        if buffer:
+            consume(buffer)
+    finally:
+        selector.close()
+
+    if process.poll() is None:
+        process.wait()
+    return FfmpegOutcome(
+        return_code=int(process.returncode or 0),
+        processed_seconds=processed_seconds,
+        speed=speed,
+        stalled=stalled,
+    )
 
 
 def run_ffmpeg(
@@ -1094,6 +1309,7 @@ def run_ffmpeg(
     state_directory: Path,
     runtime_environment: dict[str, str],
     progress: ProgressReporter,
+    attempt: int,
 ) -> tuple[str, str]:
     item = stream.item
     final_path = safe_child(volume.mount_point, output_directory / item.filename)
@@ -1120,8 +1336,32 @@ def run_ffmpeg(
         )
         return "failed", f"{item.filename}: 同名の不完全なファイルがあります。上書きせず停止 ({detail})"
 
+    if temp_path.exists():
+        valid, detail = verify_mp4(temp_path, stream.duration_seconds)
+        if valid:
+            validate_external_volume(volume.mount_point, expected=volume)
+            os.replace(temp_path, final_path)
+            progress.update(
+                stream,
+                "前回の一時MP4を検証して完了",
+                processed_seconds=stream.duration_seconds,
+                force=True,
+                terminal=True,
+                completed=True,
+            )
+            return (
+                "completed",
+                f"{item.filename}: 前回の一時MP4を救済して完了 "
+                f"({detail}, {human_bytes(final_path.stat().st_size)})",
+            )
+
     validate_external_volume(volume.mount_point, expected=volume)
-    progress.update(stream, "ffmpeg準備中", processed_seconds=0, force=True)
+    progress.update(
+        stream,
+        f"ffmpeg準備中（{attempt}/{FFMPEG_MAX_ATTEMPTS}回目）",
+        processed_seconds=0,
+        force=True,
+    )
     command = [
         shutil.which("ffmpeg") or "ffmpeg",
         "-hide_banner",
@@ -1138,6 +1378,24 @@ def run_ffmpeg(
         USER_AGENT,
         "-headers",
         f"Referer: {item.page_url}\r\nOrigin: {SITE_ORIGIN}\r\n",
+        "-rw_timeout",
+        str(FFMPEG_IO_TIMEOUT_MICROSECONDS),
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_on_network_error",
+        "1",
+        "-reconnect_on_http_error",
+        "408,429,5xx",
+        "-reconnect_delay_max",
+        "10",
+        "-reconnect_max_retries",
+        "5",
+        "-reconnect_delay_total_max",
+        "60",
+        "-seg_max_retry",
+        "5",
         "-i",
         stream.variant_url,
         "-map",
@@ -1146,14 +1404,13 @@ def run_ffmpeg(
         "0:a:0?",
         "-c",
         "copy",
-        "-movflags",
-        "+faststart",
         str(temp_path),
     ]
 
     with ffmpeg_log.open("a", encoding="utf-8") as log_handle:
         log_handle.write(
-            f"\n=== {dt.datetime.now().astimezone().isoformat()} {stream.width}x{stream.height} ===\n"
+            f"\n=== {dt.datetime.now().astimezone().isoformat()} "
+            f"{stream.width}x{stream.height} attempt={attempt}/{FFMPEG_MAX_ATTEMPTS} ===\n"
         )
         log_handle.flush()
         process = subprocess.Popen(
@@ -1162,84 +1419,56 @@ def run_ffmpeg(
             stderr=log_handle,
             env=runtime_environment,
             cwd=output_directory,
-            text=True,
-            bufsize=1,
+            bufsize=0,
         )
         with ACTIVE_PROCESSES_LOCK:
             ACTIVE_PROCESSES.add(process)
+            SIGINT_SENT_PROCESSES.discard(process)
         try:
-            processed_seconds = 0.0
-            speed = ""
-            if process.stdout is None:
-                raise DownloadError("ffmpegの進捗出力を取得できませんでした。")
-            for raw_line in process.stdout:
-                key, separator, value = raw_line.strip().partition("=")
-                if not separator:
-                    continue
-                if key == "out_time":
-                    processed_seconds = parse_ffmpeg_time(value)
-                elif key == "speed":
-                    speed = value
-                elif key == "progress":
-                    if value == "end":
-                        progress.update(
-                            stream,
-                            "データ取得完了・ffmpeg終了確認中",
-                            processed_seconds=stream.duration_seconds,
-                            speed=speed,
-                            force=True,
-                        )
-                    else:
-                        progress.update(
-                            stream,
-                            "ダウンロード＋MP4作成中（ffmpeg）",
-                            processed_seconds=min(processed_seconds, stream.duration_seconds * 0.999),
-                            speed=speed,
-                        )
-            return_code = process.wait()
+            outcome = monitor_ffmpeg(process, stream, progress)
+        except Exception:
+            if process.poll() is None:
+                stop_process_gracefully(process)
+            raise
         finally:
             with ACTIVE_PROCESSES_LOCK:
                 ACTIVE_PROCESSES.discard(process)
+                SIGINT_SENT_PROCESSES.discard(process)
+
+    valid, detail = verify_mp4(temp_path, stream.duration_seconds)
+    if valid:
+        validate_external_volume(volume.mount_point, expected=volume)
+        os.replace(temp_path, final_path)
+        progress.update(
+            stream,
+            "完了",
+            processed_seconds=stream.duration_seconds,
+            force=True,
+            terminal=True,
+            completed=True,
+        )
+        return "completed", f"{item.filename}: 完了 ({detail}, {human_bytes(final_path.stat().st_size)})"
 
     if STOP_EVENT.is_set():
         progress.update(stream, "中断", force=True, terminal=True)
         return "failed", f"{item.filename}: 中断されました（部分ファイルはHDD内に残しています）"
-    if return_code != 0:
-        progress.update(
-            stream,
-            f"ffmpeg失敗（終了コード {return_code}）",
-            force=True,
-            terminal=True,
-        )
-        return "failed", f"{item.filename}: ffmpeg失敗 (終了コード {return_code}, ログ: {ffmpeg_log})"
 
-    validate_external_volume(volume.mount_point, expected=volume)
+    reason = (
+        f"{int(FFMPEG_STALL_TIMEOUT_SECONDS)}秒間進捗なし"
+        if outcome.stalled
+        else f"ffmpeg終了コード {outcome.return_code}"
+    )
     progress.update(
         stream,
-        "ffmpeg完了・MP4検証中",
-        processed_seconds=stream.duration_seconds,
+        f"{reason}・再試行待ち",
+        processed_seconds=min(outcome.processed_seconds, stream.duration_seconds * 0.999),
+        speed=outcome.speed,
         force=True,
     )
-    valid, detail = verify_mp4(temp_path, stream.duration_seconds)
-    if not valid:
-        progress.update(
-            stream,
-            "検証失敗",
-            processed_seconds=stream.duration_seconds,
-            force=True,
-            terminal=True,
-        )
-        return "failed", f"{item.filename}: ダウンロード後の検証に失敗 ({detail})"
-    os.replace(temp_path, final_path)
-    progress.update(
-        stream,
-        "完了",
-        processed_seconds=stream.duration_seconds,
-        force=True,
-        terminal=True,
-        completed=True,
+    return (
+        "retry",
+        f"{item.filename}: {reason}。一時MP4検証失敗 ({detail}, ログ: {ffmpeg_log})",
     )
-    return "completed", f"{item.filename}: 完了 ({detail}, {human_bytes(final_path.stat().st_size)})"
 
 
 def download_one(
@@ -1255,14 +1484,37 @@ def download_one(
         return "failed", f"{item.filename}: 中断されました"
     try:
         progress.update(stream, "開始準備中", force=True)
-        return run_ffmpeg(
-            stream,
-            volume,
-            output_directory,
-            state_directory,
-            runtime_environment,
-            progress,
-        )
+        last_error = ""
+        for attempt in range(1, FFMPEG_MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                progress.reset(stream, f"再試行を開始（{attempt}/{FFMPEG_MAX_ATTEMPTS}回目）")
+            status, message = run_ffmpeg(
+                stream,
+                volume,
+                output_directory,
+                state_directory,
+                runtime_environment,
+                progress,
+                attempt,
+            )
+            if status != "retry":
+                return status, message
+            last_error = message
+            if attempt < FFMPEG_MAX_ATTEMPTS:
+                progress.event(
+                    f"[{item.filename}] 通信停滞またはffmpeg失敗。"
+                    f"{FFMPEG_RETRY_DELAY_SECONDS:.0f}秒後に自動再試行します。"
+                )
+                retry_at = time.monotonic() + FFMPEG_RETRY_DELAY_SECONDS
+                while True:
+                    if STOP_EVENT.is_set():
+                        return "failed", f"{item.filename}: 中断されました"
+                    remaining_delay = retry_at - time.monotonic()
+                    if remaining_delay <= 0:
+                        break
+                    time.sleep(min(0.1, remaining_delay))
+        progress.update(stream, "再試行上限・次の動画へ進みます", force=True, terminal=True)
+        return "failed", f"{last_error} / 自動再試行上限に到達"
     except Exception as error:
         progress.update(stream, f"失敗: {error}", force=True, terminal=True)
         return "failed", f"{item.filename}: {error}"
@@ -1340,6 +1592,16 @@ https://example.invalid/720.m3u8
     variants = parse_manifest_variants(manifest)
     assert choose_variant(variants, 1080)["height"] == 1080
     assert choose_variant(variants, 720)["height"] == 720
+    media_manifest = """#EXTM3U
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXTINF:6.006,
+segment-1.ts
+#EXTINF:5.500,
+segment-2.ts
+#EXT-X-ENDLIST
+"""
+    assert media_playlist_duration(media_manifest) == 11.506
+    assert media_playlist_duration(media_manifest.replace("#EXT-X-ENDLIST", "")) is None
     item = ArchiveItem(1, "2026-07-23", 1, "1コート", "a" * 32, None, None)
     assert item.filename == "2026-07-23_01.mp4"
     assert extract_court("36コート 和歌山県立体育館") == 36
@@ -1373,6 +1635,36 @@ https://example.invalid/720.m3u8
     plain_reporter.update(test_stream, "ダウンロード中", processed_seconds=10, force=True)
     plain_reporter.close()
     assert "\x1b[" not in plain_output.getvalue()
+    stall_output = io.StringIO()
+    stall_reporter = ProgressReporter([test_stream], output=stall_output, live=False)
+    stall_process = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import time; "
+                "print('out_time=00:00:01.000000', flush=True); "
+                "print('progress=continue', flush=True); "
+                "time.sleep(60)"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=0,
+    )
+    stall_outcome = monitor_ffmpeg(
+        stall_process,
+        test_stream,
+        stall_reporter,
+        stall_timeout=0.2,
+    )
+    stall_reporter.close()
+    with ACTIVE_PROCESSES_LOCK:
+        SIGINT_SENT_PROCESSES.discard(stall_process)
+    assert stall_outcome.stalled
+    assert stall_outcome.processed_seconds == 1.0
+    assert stall_process.poll() is not None
     print("自己テスト: OK")
 
 
@@ -1405,8 +1697,10 @@ def parse_args() -> argparse.Namespace:
   保存フォルダ名は inhigh-tv-2026-badminton です。
   旧版の日本語名フォルダは、実際のダウンロード開始時だけASCII名へ変更されます。
   Terminal上の進捗は固定領域を書き換え、完了・失敗などの確定結果だけを履歴に残します。
+  180秒間進捗が止まった動画は安全に終了し、1回自動再試行してから次の動画へ進みます。
+  Ctrl+Cは1回だけ押してください。追加操作なしで最大40秒以内に段階的に停止します。
   完成済みMP4は検証後に選択肢から除外されます。
-  Ctrl+Cで中断した部分ファイルは外付けHDD内に残り、再選択時は最初から上書きされます。""",
+  中断時に完成していた一時MP4は次回救済し、不完全なものだけ最初から上書きします。""",
     )
     parser._optionals.title = "オプション"
     parser.add_argument(
@@ -1650,6 +1944,7 @@ def main() -> int:
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs)
     futures: dict[concurrent.futures.Future[tuple[str, str]], ArchiveItem] = {}
     progress = ProgressReporter(list(streams.values()))
+    executor_shutdown = False
     try:
         for item in items:
             stream = streams.get(item.filename)
@@ -1684,12 +1979,22 @@ def main() -> int:
                 state["failed"][item.filename] = message
             save_state(state_path, state, volume)
     except KeyboardInterrupt:
-        progress.close()
-        print("中断しています。完了済み動画は次回スキップされます…")
-        terminate_active_processes()
+        previous_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            progress.close()
+            print(
+                "中断処理中です。MP4を安全に確定するため、追加のCtrl+Cは不要です。"
+                "最大40秒で段階的に停止します…"
+            )
+            terminate_active_processes()
+            executor.shutdown(wait=True, cancel_futures=True)
+            executor_shutdown = True
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
         raise
     finally:
-        executor.shutdown(wait=True, cancel_futures=True)
+        if not executor_shutdown:
+            executor.shutdown(wait=True, cancel_futures=True)
         progress.close()
         if caffeinate_process and caffeinate_process.poll() is None:
             caffeinate_process.terminate()
