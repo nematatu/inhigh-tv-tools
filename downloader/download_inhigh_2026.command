@@ -23,6 +23,7 @@ import concurrent.futures
 import curses
 import dataclasses
 import datetime as dt
+import io
 import json
 import os
 import plistlib
@@ -33,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -300,23 +302,82 @@ def interactive_select_items(items: list[ArchiveItem]) -> list[ArchiveItem]:
 
 
 class ProgressReporter:
-    """動画別と全体の進捗・実測速度ベースETAを表示する。"""
+    """TTYでは固定ダッシュボード、非TTYでは間引いた進捗ログを表示する。"""
 
-    def __init__(self, streams: list[StreamInfo]) -> None:
+    def __init__(
+        self,
+        streams: list[StreamInfo],
+        *,
+        output: Any | None = None,
+        live: bool | None = None,
+    ) -> None:
         self._streams = {stream.item.filename: stream for stream in streams}
         self._processed = {filename: 0.0 for filename in self._streams}
         self._speed_factors: dict[str, float] = {}
+        self._speed_labels: dict[str, str] = {}
+        self._phases = {filename: "待機中" for filename in self._streams}
         self._active: set[str] = set()
         self._terminal: set[str] = set()
         self._completed: set[str] = set()
         self._last_bucket: dict[str, int] = {}
         self._last_phase: dict[str, str] = {}
-        self._last_overall_signature: tuple[int, int, int, int | None] | None = None
+        self._last_overall_bucket: int | None = None
+        self._last_overall_output_at: float | None = None
+        self._output = output or sys.stdout
+        detected_live = bool(getattr(self._output, "isatty", lambda: False)())
+        self._live = detected_live if live is None else live
+        self._rendered_lines = 0
+        self._last_rendered_at = 0.0
+        self._closed = False
 
     @staticmethod
     def _bar(percent: float, width: int = 24) -> str:
         filled = min(width, int(percent / 100 * width))
         return "█" * filled + "░" * (width - filled)
+
+    @staticmethod
+    def _display_width(text: str) -> int:
+        width = 0
+        for character in text:
+            if unicodedata.combining(character):
+                continue
+            width += 2 if unicodedata.east_asian_width(character) in ("W", "F") else 1
+        return width
+
+    @classmethod
+    def _fit_line(cls, text: str, width: int) -> str:
+        if width <= 0:
+            return ""
+        if cls._display_width(text) <= width:
+            return text
+        if width == 1:
+            return "…"
+        result: list[str] = []
+        used = 0
+        limit = width - 1
+        for character in text:
+            character_width = (
+                0
+                if unicodedata.combining(character)
+                else 2 if unicodedata.east_asian_width(character) in ("W", "F") else 1
+            )
+            if used + character_width > limit:
+                break
+            result.append(character)
+            used += character_width
+        return "".join(result) + "…"
+
+    def _terminal_size(self) -> os.terminal_size:
+        try:
+            return os.get_terminal_size(self._output.fileno())
+        except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+            return shutil.get_terminal_size(fallback=(120, 24))
+
+    def _overall_values(self) -> tuple[float, tuple[float, float] | None]:
+        total_duration = sum(stream.duration_seconds for stream in self._streams.values())
+        processed = sum(self._processed.values())
+        percent = min(100.0, processed / total_duration * 100) if total_duration > 0 else 100.0
+        return percent, self._overall_eta()
 
     def _overall_eta(self) -> tuple[float, float] | None:
         remaining = sum(
@@ -336,23 +397,10 @@ class ProgressReporter:
             return None
         return remaining, remaining / aggregate_speed
 
-    def _print_overall(self, *, force: bool = False) -> None:
-        total_duration = sum(stream.duration_seconds for stream in self._streams.values())
-        processed = sum(self._processed.values())
-        percent = min(100.0, processed / total_duration * 100) if total_duration > 0 else 100.0
-        eta = self._overall_eta()
-        eta_slot: int | None = None
-        if eta:
-            _, remaining_wall_seconds = eta
-            finish = dt.datetime.now().astimezone() + dt.timedelta(seconds=remaining_wall_seconds)
-            eta_slot = int(finish.timestamp() // 300)
-        signature = (int(percent), len(self._completed), len(self._terminal), eta_slot)
-        if not force and signature == self._last_overall_signature:
-            return
-        self._last_overall_signature = signature
-
+    def _overall_status(self) -> str:
+        percent, eta = self._overall_values()
         status = (
-            f"[全体] [{self._bar(percent)}] {percent:5.1f}%"
+            f"[全体] [{self._bar(percent, width=16)}] {percent:5.1f}%"
             f" | 完了 {len(self._completed)}/{len(self._streams)}"
         )
         if eta is None:
@@ -361,9 +409,120 @@ class ProgressReporter:
             _, remaining_wall_seconds = eta
             status += (
                 f" | 残り {clock_time(remaining_wall_seconds)}"
-                f" | 推定終了 {estimated_finish_label(remaining_wall_seconds)}"
+                f" | 終了予定 {estimated_finish_label(remaining_wall_seconds)}"
             )
-        print(status, flush=True)
+        return status
+
+    def _stream_status_parts(self, filename: str) -> tuple[str, str]:
+        stream = self._streams[filename]
+        processed = self._processed[filename]
+        percent = (
+            min(100.0, processed / stream.duration_seconds * 100)
+            if stream.duration_seconds > 0
+            else 100.0
+        )
+        status = (
+            f"[{filename}] [{self._bar(percent, width=12)}] {percent:5.1f}%"
+            f" | {self._phases[filename]}"
+        )
+        timing = (
+            f"  処理 {clock_time(processed)}/{clock_time(stream.duration_seconds)}"
+        )
+        speed_label = self._speed_labels.get(filename, "")
+        speed_factor = self._speed_factors.get(filename)
+        if speed_label and speed_label != "N/A":
+            timing += f" | {speed_label}"
+        if speed_factor is not None and percent < 100:
+            remaining_wall = max(0.0, stream.duration_seconds - processed) / speed_factor
+            timing += (
+                f" | 残り {clock_time(remaining_wall)}"
+                f" | 完了予定 {estimated_finish_label(remaining_wall)}"
+            )
+        return status, timing
+
+    def _stream_status(self, filename: str) -> str:
+        status, timing = self._stream_status_parts(filename)
+        return f"{status} | {timing.strip()}"
+
+    def _dashboard_lines(self) -> list[str]:
+        size = self._terminal_size()
+        active = [
+            filename
+            for filename in self._streams
+            if filename in self._active and filename not in self._terminal
+        ]
+        max_active_items = max(1, (size.lines - 4) // 2)
+        visible_active = active[:max_active_items]
+        lines = [
+            "進捗（この領域を更新します。Ctrl+Cで中断）",
+            self._overall_status(),
+        ]
+        for filename in visible_active:
+            lines.extend(self._stream_status_parts(filename))
+        queued = len(self._streams) - len(active) - len(self._terminal)
+        hidden = len(active) - len(visible_active)
+        details: list[str] = []
+        if queued > 0:
+            details.append(f"待機 {queued}本")
+        if hidden > 0:
+            details.append(f"画面外で処理中 {hidden}本")
+        if details:
+            lines.append("  " + " / ".join(details))
+        width = max(1, size.columns - 1)
+        return [self._fit_line(line, width) for line in lines]
+
+    def _clear_live_locked(self) -> None:
+        if not self._live or self._rendered_lines <= 0:
+            return
+        for _ in range(self._rendered_lines):
+            self._output.write("\x1b[1A\r\x1b[2K")
+        self._rendered_lines = 0
+
+    def _render_live_locked(self, *, force: bool = False) -> None:
+        if not self._live or self._closed:
+            return
+        now = time.monotonic()
+        if not force and self._last_rendered_at and now - self._last_rendered_at < 0.2:
+            return
+        self._clear_live_locked()
+        lines = self._dashboard_lines()
+        for line in lines:
+            self._output.write(f"\r\x1b[2K{line}\n")
+        self._output.flush()
+        self._rendered_lines = len(lines)
+        self._last_rendered_at = now
+
+    def _emit_non_live_locked(
+        self,
+        filename: str,
+        *,
+        force: bool,
+        terminal: bool,
+        phase_changed: bool,
+        bucket: int,
+    ) -> None:
+        should_print_file = (
+            force
+            or phase_changed
+            or self._last_bucket.get(filename) != bucket
+        )
+        if should_print_file:
+            self._last_bucket[filename] = bucket
+            print(self._stream_status(filename), file=self._output, flush=True)
+
+        percent, _ = self._overall_values()
+        overall_bucket = int(percent // 5)
+        now = time.monotonic()
+        should_print_overall = (
+            self._last_overall_output_at is None
+            or terminal
+            or self._last_overall_bucket != overall_bucket
+            or now - self._last_overall_output_at >= 60
+        )
+        if should_print_overall:
+            print(self._overall_status(), file=self._output, flush=True)
+            self._last_overall_output_at = now
+            self._last_overall_bucket = overall_bucket
 
     def update(
         self,
@@ -380,9 +539,11 @@ class ProgressReporter:
         percent: float | None = None
         if processed_seconds is not None and stream.duration_seconds > 0:
             percent = min(100.0, max(0.0, processed_seconds / stream.duration_seconds * 100))
-        bucket = int(percent) if percent is not None else -1
+        bucket = int(percent // 5) if percent is not None else -1
 
         with OUTPUT_LOCK:
+            if self._closed:
+                return
             if filename not in self._terminal:
                 self._active.add(filename)
             if processed_seconds is not None:
@@ -393,43 +554,44 @@ class ProgressReporter:
             speed_factor = parse_speed_factor(speed)
             if speed_factor is not None:
                 self._speed_factors[filename] = speed_factor
+                self._speed_labels[filename] = speed.strip()
             if terminal:
                 self._terminal.add(filename)
                 self._active.discard(filename)
                 self._speed_factors.pop(filename, None)
             if completed:
                 self._completed.add(filename)
+            phase_changed = self._last_phase.get(filename) != phase
+            self._phases[filename] = phase
+            self._last_phase[filename] = phase
+            if self._live:
+                self._render_live_locked(force=force or terminal or phase_changed)
+            else:
+                self._emit_non_live_locked(
+                    filename,
+                    force=force,
+                    terminal=terminal,
+                    phase_changed=phase_changed,
+                    bucket=bucket,
+                )
 
-            should_print = (
-                force
-                or self._last_phase.get(filename) != phase
-                or self._last_bucket.get(filename) != bucket
-            )
-            if should_print:
-                self._last_phase[filename] = phase
-                self._last_bucket[filename] = bucket
-                if percent is None:
-                    print(f"[{filename}] {phase}", flush=True)
-                else:
-                    elapsed = clock_time(processed_seconds or 0)
-                    total = clock_time(stream.duration_seconds)
-                    speed_text = f" | {speed}" if speed and speed != "N/A" else ""
-                    eta_text = ""
-                    if speed_factor is not None and percent < 100:
-                        remaining_wall = max(
-                            0.0,
-                            stream.duration_seconds - (processed_seconds or 0),
-                        ) / speed_factor
-                        eta_text = (
-                            f" | 残り {clock_time(remaining_wall)}"
-                            f" / 推定完了 {estimated_finish_label(remaining_wall)}"
-                        )
-                    print(
-                        f"[{filename}] [{self._bar(percent)}] {percent:5.1f}%"
-                        f" | {elapsed}/{total}{speed_text}{eta_text} | {phase}",
-                        flush=True,
-                    )
-            self._print_overall(force=force or terminal)
+    def event(self, message: str) -> None:
+        """固定表示を一時消去し、完了・失敗などの確定イベントを1行残す。"""
+        with OUTPUT_LOCK:
+            if self._live and not self._closed:
+                self._clear_live_locked()
+            print(message, file=self._output, flush=True)
+            if self._live and not self._closed:
+                self._render_live_locked(force=True)
+
+    def close(self) -> None:
+        """固定表示を消去して、後続の通常出力が崩れない状態へ戻す。"""
+        with OUTPUT_LOCK:
+            if self._closed:
+                return
+            self._clear_live_locked()
+            self._output.flush()
+            self._closed = True
 
 
 def fetch_bytes(url: str, *, headers: dict[str, str] | None = None, timeout: int = 30) -> bytes:
@@ -1191,6 +1353,26 @@ https://example.invalid/720.m3u8
     assert MenuOption("2026-07-23", "7月23日").value == "2026-07-23"
     assert OUTPUT_DIRECTORY_NAME.isascii()
     assert re.fullmatch(r"[a-z0-9-]+", OUTPUT_DIRECTORY_NAME)
+    test_stream = StreamInfo(item, "https://example.invalid/video.m3u8", 100, 1920, 1080, 1)
+    live_output = io.StringIO()
+    live_reporter = ProgressReporter([test_stream], output=live_output, live=True)
+    live_reporter.update(
+        test_stream,
+        "ダウンロード中",
+        processed_seconds=10,
+        speed="2.00x",
+        force=True,
+    )
+    live_reporter.update(test_stream, "ダウンロード中", processed_seconds=20, speed="2.00x")
+    live_reporter.event("[1/1] テスト完了")
+    live_reporter.close()
+    assert "\x1b[1A" in live_output.getvalue()
+    assert "[1/1] テスト完了" in live_output.getvalue()
+    plain_output = io.StringIO()
+    plain_reporter = ProgressReporter([test_stream], output=plain_output, live=False)
+    plain_reporter.update(test_stream, "ダウンロード中", processed_seconds=10, force=True)
+    plain_reporter.close()
+    assert "\x1b[" not in plain_output.getvalue()
     print("自己テスト: OK")
 
 
@@ -1222,6 +1404,7 @@ def parse_args() -> argparse.Namespace:
 補足:
   保存フォルダ名は inhigh-tv-2026-badminton です。
   旧版の日本語名フォルダは、実際のダウンロード開始時だけASCII名へ変更されます。
+  Terminal上の進捗は固定領域を書き換え、完了・失敗などの確定結果だけを履歴に残します。
   完成済みMP4は検証後に選択肢から除外されます。
   Ctrl+Cで中断した部分ファイルは外付けHDD内に残り、再選択時は最初から上書きされます。""",
     )
@@ -1489,8 +1672,7 @@ def main() -> int:
                 status, message = future.result()
             except Exception as error:
                 status, message = "failed", f"{item.filename}: {error}"
-            with OUTPUT_LOCK:
-                print(f"[{index}/{len(futures)}] {message}")
+            progress.event(f"[{index}/{len(futures)}] {message}")
             append_log(master_log, message)
             if status == "completed":
                 state["completed"].append(item.filename)
@@ -1502,11 +1684,13 @@ def main() -> int:
                 state["failed"][item.filename] = message
             save_state(state_path, state, volume)
     except KeyboardInterrupt:
-        print("\n中断しています。完了済み動画は次回スキップされます…")
+        progress.close()
+        print("中断しています。完了済み動画は次回スキップされます…")
         terminate_active_processes()
         raise
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+        progress.close()
         if caffeinate_process and caffeinate_process.poll() is None:
             caffeinate_process.terminate()
             try:
