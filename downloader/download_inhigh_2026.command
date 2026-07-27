@@ -59,8 +59,11 @@ EXPECTED_ARCHIVE_COUNTS = {
     "2026-07-26": 36,
     "2026-07-27": 8,
 }
-OUTPUT_DIRECTORY_NAME = "インターハイ2026_バドミントン"
-LEGACY_OUTPUT_DIRECTORY_NAME = "インターハイ2026_バドミントン_7月23-25日"
+OUTPUT_DIRECTORY_NAME = "inhigh-tv-2026-badminton"
+LEGACY_OUTPUT_DIRECTORY_NAMES = (
+    "インターハイ2026_バドミントン_7月23-25日",
+    "インターハイ2026_バドミントン",
+)
 STATE_DIRECTORY_NAME = ".inhigh-download"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 Chrome/150 Safari/537.36"
 VOLUMES_ROOT = Path("/Volumes")
@@ -781,16 +784,50 @@ def safe_child(volume_root: Path, path: Path) -> Path:
     return path
 
 
-def output_directory_for(volume: Volume) -> Path:
-    """既存利用者は旧フォルダを継続し、新規利用者は日付非依存名を使う。"""
+def output_directory_for(volume: Volume, *, migrate_legacy: bool = False) -> Path:
+    """ASCII名を使用し、実行開始時だけ旧フォルダを同一HDD内で改名する。"""
     current = safe_child(volume.mount_point, volume.mount_point / OUTPUT_DIRECTORY_NAME)
-    legacy = safe_child(volume.mount_point, volume.mount_point / LEGACY_OUTPUT_DIRECTORY_NAME)
-    if current.exists() and legacy.exists():
+    legacy_directories = [
+        safe_child(volume.mount_point, volume.mount_point / name)
+        for name in LEGACY_OUTPUT_DIRECTORY_NAMES
+    ]
+    existing_legacy = [path for path in legacy_directories if path.exists()]
+    if current.exists() and not current.is_dir():
+        raise DownloadError(f"保存先と同名のファイルがあるため停止しました: {current}")
+    if current.exists() and existing_legacy:
         raise DownloadError(
-            "保存フォルダが新旧2つ存在します。内容を自動統合できないため停止しました: "
-            f"{current} / {legacy}"
+            "保存フォルダが新旧両方に存在します。内容を自動統合できないため停止しました: "
+            f"{current} / {', '.join(map(str, existing_legacy))}"
         )
-    return legacy if legacy.exists() else current
+    if len(existing_legacy) > 1:
+        raise DownloadError(
+            "旧保存フォルダが複数存在します。内容を自動統合できないため停止しました: "
+            f"{', '.join(map(str, existing_legacy))}"
+        )
+    if not existing_legacy:
+        return current
+
+    legacy = existing_legacy[0]
+    if not legacy.is_dir() or legacy.is_symlink():
+        raise DownloadError(f"旧保存フォルダを安全に確認できません: {legacy}")
+    if not migrate_legacy:
+        return legacy
+
+    validate_external_volume(volume.mount_point, expected=volume)
+    move = subprocess.run(
+        ["/bin/mv", "-n", str(legacy), str(current)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if move.returncode != 0 or legacy.exists() or not current.is_dir():
+        detail = move.stderr.strip() or "保存先がすでに存在する可能性があります"
+        raise DownloadError(
+            f"旧保存フォルダをASCII名へ変更できませんでした: {legacy} -> {current} ({detail})"
+        )
+    print(f"旧保存フォルダを移行しました: {legacy.name} -> {current.name}")
+    return safe_child(volume.mount_point, current)
 
 
 def verify_mp4(path: Path, expected_duration: float | None = None) -> tuple[bool, str]:
@@ -1106,7 +1143,7 @@ def preflight_streams(
 
 
 def create_runtime_directories(volume: Volume) -> tuple[Path, Path, dict[str, str]]:
-    output_directory = output_directory_for(volume)
+    output_directory = output_directory_for(volume, migrate_legacy=True)
     if output_directory.exists() and output_directory.is_symlink():
         raise DownloadError(f"保存先がシンボリックリンクのため拒否しました: {output_directory}")
     output_directory.mkdir(parents=False, exist_ok=True)
@@ -1152,6 +1189,8 @@ https://example.invalid/720.m3u8
     assert estimated_finish_label(3600, test_now) == "21:00頃"
     assert estimated_finish_label(36000, test_now) == "07/28 06:00頃"
     assert MenuOption("2026-07-23", "7月23日").value == "2026-07-23"
+    assert OUTPUT_DIRECTORY_NAME.isascii()
+    assert re.fullmatch(r"[a-z0-9-]+", OUTPUT_DIRECTORY_NAME)
     print("自己テスト: OK")
 
 
@@ -1181,6 +1220,8 @@ def parse_args() -> argparse.Namespace:
     ./download_inhigh_2026.command --check-only --yes
 
 補足:
+  保存フォルダ名は inhigh-tv-2026-badminton です。
+  旧版の日本語名フォルダは、実際のダウンロード開始時だけASCII名へ変更されます。
   完成済みMP4は検証後に選択肢から除外されます。
   Ctrl+Cで中断した部分ファイルは外付けHDD内に残り、再選択時は最初から上書きされます。""",
     )
@@ -1337,7 +1378,8 @@ def main() -> int:
     estimated_bytes = sum(stream.estimated_bytes for stream in streams.values())
     duration_seconds = sum(stream.duration_seconds for stream in streams.values())
 
-    output_directory = output_directory_for(volume)
+    existing_output_directory = output_directory_for(volume)
+    output_directory = safe_child(volume.mount_point, volume.mount_point / OUTPUT_DIRECTORY_NAME)
     required_free = int(estimated_bytes * ESTIMATE_MARGIN) + MINIMUM_EXTRA_BYTES
     usage = shutil.disk_usage(volume.mount_point)
 
@@ -1368,6 +1410,11 @@ def main() -> int:
     if not streams:
         raise DownloadError("選択した動画には、現在ダウンロード可能な配信情報がありません。")
 
+    if existing_output_directory != output_directory:
+        print(
+            "旧保存フォルダを検出しました。ダウンロード開始時に、途中ファイルを保持したまま"
+            f" {output_directory.name} へ変更します。"
+        )
     print(f"\n保存フォルダ: {output_directory}")
     print("ファイル名例: 2026-07-23_01.mp4")
     if not args.yes:
