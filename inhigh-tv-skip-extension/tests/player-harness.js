@@ -37,10 +37,36 @@
         this.dataset.mockCurrentTime = String(Number(value));
       },
     },
+    paused: {
+      configurable: true,
+      get() {
+        return this.dataset.mockPaused !== "false";
+      },
+    },
+    ended: {
+      configurable: true,
+      get() {
+        return false;
+      },
+    },
+    play: {
+      configurable: true,
+      value() {
+        this.dataset.mockPaused = "false";
+        return Promise.resolve();
+      },
+    },
+    pause: {
+      configurable: true,
+      value() {
+        this.dataset.mockPaused = "true";
+      },
+    },
   });
 
   const video = document.querySelector("video.vjs-tech");
   video.dataset.mockCurrentTime = "100";
+  video.dataset.mockPaused = "true";
 
   document.querySelector("#set-five-seconds").addEventListener("click", () => {
     listeners.forEach((listener) => {
