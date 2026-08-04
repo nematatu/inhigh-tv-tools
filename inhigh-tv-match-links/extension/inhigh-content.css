@@ -1,0 +1,13 @@
+.inhigh-deeplink-notice {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2147483647;
+  max-width: min(360px, calc(100vw - 32px));
+  padding: 10px 14px;
+  border-radius: 8px;
+  color: #fff;
+  background: rgb(0 0 0 / 78%);
+  box-shadow: 0 2px 12px rgb(0 0 0 / 28%);
+  font: 600 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}

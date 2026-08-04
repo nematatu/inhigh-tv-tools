@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "インハイTV 試合リンク",
+  "version": "0.1.0",
+  "description": "BIRD SCOREの試合からインハイTV公式アーカイブの試合開始位置へ移動します。",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.birdscore.live/web/interhigh-2026-wakayama-team/*",
+        "https://www.birdscore.live/web/interhigh-2026-wakayama-Individual/*"
+      ],
+      "css": ["birdscore-content.css"],
+      "js": ["birdscore-content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://inhightv.sportsbull.jp/summer/archive/*"],
+      "css": ["inhigh-content.css"],
+      "js": ["inhigh-content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["data/matches.json"],
+      "matches": [
+        "https://www.birdscore.live/*",
+        "https://inhightv.sportsbull.jp/*"
+      ]
+    }
+  ]
+}

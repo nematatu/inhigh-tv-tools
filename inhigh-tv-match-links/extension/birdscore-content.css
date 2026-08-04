@@ -1,0 +1,33 @@
+.inhigh-match-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  margin: 8px 0;
+  padding: 5px 12px;
+  border: 0;
+  border-radius: 5px;
+  color: #fff !important;
+  background: #146c43 !important;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-decoration: none !important;
+  cursor: pointer;
+}
+
+.inhigh-match-link:hover,
+.inhigh-match-link:focus-visible {
+  background: #0f5132 !important;
+  text-decoration: none !important;
+}
+
+.inhigh-match-link--unavailable {
+  color: #6c757d !important;
+  background: #e9ecef !important;
+  cursor: default;
+}
+
+.inhigh-match-link--added-to-order {
+  margin: 6px 0;
+}

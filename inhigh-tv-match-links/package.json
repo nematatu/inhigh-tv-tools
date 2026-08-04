@@ -1,0 +1,10 @@
+{
+  "name": "inhigh-tv-match-links",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build:data": "node tools/build-data.mjs",
+    "serve": "python3 -m http.server 8080 -d site"
+  }
+}

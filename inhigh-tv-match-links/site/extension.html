@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>拡張機能の導入 | 2026 インターハイ 試合リンク集</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <div class="hero__inner">
+        <p class="eyebrow">BROWSER EXTENSION</p>
+        <h1>拡張機能の導入</h1>
+        <p class="lead">BIRD SCOREの各試合に「動画を見る」を追加し、公式アーカイブの試合開始位置へ移動します。</p>
+        <nav class="source-links" aria-label="ページ移動">
+          <a href="index.html">リンク集へ戻る</a>
+        </nav>
+      </div>
+    </header>
+    <main class="page-shell">
+      <section class="panel">
+        <h2>Chrome / Edge</h2>
+        <ol>
+          <li>リポジトリ内の <code>inhigh-tv-match-links/extension/</code> フォルダを用意します。</li>
+          <li><code>chrome://extensions</code>（Edgeは <code>edge://extensions</code>）を開きます。</li>
+          <li>「デベロッパーモード」をオンにし、「パッケージ化されていない拡張機能を読み込む」から <code>extension/</code> を選びます。</li>
+          <li>BIRD SCOREの団体または個人ページを再読み込みします。</li>
+        </ol>
+        <p>拡張機能は公式ページ上の表示を補助するだけで、動画ファイルを保存・再配信しません。データで開始時刻を確認できない試合は「動画未確認」と表示します。</p>
+      </section>
+      <section class="panel">
+        <h2>対象ページ</h2>
+        <ul>
+          <li><a href="https://www.birdscore.live/web/interhigh-2026-wakayama-team/" target="_blank" rel="noreferrer">BIRD SCORE 団体</a></li>
+          <li><a href="https://www.birdscore.live/web/interhigh-2026-wakayama-Individual/" target="_blank" rel="noreferrer">BIRD SCORE 個人</a></li>
+          <li><a href="https://inhightv.sportsbull.jp/summer/archive/" target="_blank" rel="noreferrer">インハイTV公式アーカイブ</a></li>
+        </ul>
+      </section>
+    </main>
+    <footer class="footer">
+      <p><a href="index.html">リンク集へ戻る</a></p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>2026 インターハイ バドミントン 試合リンク集</title>
+    <meta
+      name="description"
+      content="BIRD SCOREの2026年インターハイ・バドミントン全試合とインハイTV公式アーカイブのリンク集"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <div class="hero__inner">
+        <p class="eyebrow">2026 INTERHIGH · BADMINTON</p>
+        <h1>試合リンク集</h1>
+        <p class="lead">
+          BIRD SCOREの団体・個人の試合情報から、インハイTV公式アーカイブの試合開始位置へ移動できます。
+        </p>
+        <nav class="source-links" aria-label="公式サイト">
+          <a href="https://www.birdscore.live/web/interhigh-2026-wakayama-team/" target="_blank" rel="noreferrer">BIRD SCORE 団体</a>
+          <a href="https://www.birdscore.live/web/interhigh-2026-wakayama-Individual/" target="_blank" rel="noreferrer">BIRD SCORE 個人</a>
+          <a href="https://inhightv.sportsbull.jp/summer/archive/" target="_blank" rel="noreferrer">インハイTV アーカイブ</a>
+        </nav>
+      </div>
+    </header>
+
+    <main class="page-shell">
+      <section class="panel intro-panel">
+        <div>
+          <h2>動画を見るには</h2>
+          <p>
+            「動画を見る」はインハイTV公式ページを開きます。試合開始位置への自動移動には、同梱のManifest V3拡張機能を導入してください。
+          </p>
+        </div>
+        <a class="secondary-button" href="extension.html" aria-label="拡張機能の導入手順を確認">拡張機能の導入手順</a>
+      </section>
+
+      <section class="panel controls-panel" aria-labelledby="filter-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">FILTER</p>
+            <h2 id="filter-title">試合を絞り込む</h2>
+          </div>
+          <p id="result-summary" class="result-summary" aria-live="polite">読み込み中…</p>
+        </div>
+        <div class="filters">
+          <label>
+            種別
+            <select id="type-filter">
+              <option value="all">団体・個人</option>
+              <option value="team">団体</option>
+              <option value="individual">個人</option>
+            </select>
+          </label>
+          <label>
+            種目
+            <select id="category-filter">
+              <option value="all">すべて</option>
+            </select>
+          </label>
+          <label>
+            日付
+            <select id="date-filter">
+              <option value="all">すべて</option>
+            </select>
+          </label>
+          <label>
+            コート
+            <select id="court-filter">
+              <option value="all">すべて</option>
+            </select>
+          </label>
+          <label class="search-field">
+            検索
+            <input id="search-filter" type="search" placeholder="試合番号・選手・学校名" autocomplete="off" />
+          </label>
+          <label class="checkbox-field">
+            <input id="available-only" type="checkbox" />
+            動画リンクありだけ表示
+          </label>
+        </div>
+      </section>
+
+      <section class="stats-grid" aria-label="件数">
+        <div class="stat-card"><span>全試合</span><strong id="count-total">—</strong></div>
+        <div class="stat-card stat-card--available"><span>動画リンクあり</span><strong id="count-available">—</strong></div>
+        <div class="stat-card stat-card--pending"><span>未実施</span><strong id="count-not-played">—</strong></div>
+        <div class="stat-card stat-card--unavailable"><span>動画未確認</span><strong id="count-unavailable">—</strong></div>
+      </section>
+
+      <section id="matches" class="match-list" aria-live="polite">
+        <p class="loading-state">データを読み込んでいます…</p>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>このページは公式公開データへのリンクをまとめた静的ページです。動画ファイルは再配信しません。</p>
+      <p id="generated-at"></p>
+    </footer>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
